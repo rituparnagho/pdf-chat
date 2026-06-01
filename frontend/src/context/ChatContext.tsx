@@ -2,11 +2,12 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useRef,
   useState,
   type ReactNode,
 } from "react";
-import { askQuestion, deleteSession, uploadPDF } from "@/api/client";
+import { deleteSession, streamQuestion, uploadPDF } from "@/api/client";
 import type { AppState, Message, UploadedFile } from "@/types";
 
 interface ChatContextValue {
@@ -21,12 +22,46 @@ interface ChatContextValue {
 
 const ChatContext = createContext<ChatContextValue | null>(null);
 
+const STORAGE_KEY = "pdf-chat-history";
+
 export function ChatProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<AppState>("idle");
   const [uploadedFile, setUploadedFile] = useState<UploadedFile | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [error, setError] = useState<string | null>(null);
   const sessionIdRef = useRef<string | null>(null);
+
+  // Restore chat history from localStorage on mount
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) {
+        const { file, msgs, sessionId } = JSON.parse(saved);
+        if (file && msgs && sessionId) {
+          setUploadedFile(file);
+          setMessages(msgs);
+          sessionIdRef.current = sessionId;
+          setState("ready");
+        }
+      }
+    } catch {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+  }, []);
+
+  // Persist chat history whenever messages or file changes
+  useEffect(() => {
+    if (uploadedFile && sessionIdRef.current) {
+      localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify({
+          file: uploadedFile,
+          msgs: messages,
+          sessionId: sessionIdRef.current,
+        })
+      );
+    }
+  }, [messages, uploadedFile]);
 
   const handleUpload = useCallback(async (file: File) => {
     setError(null);
@@ -35,11 +70,12 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       setState("processing");
       const data = await uploadPDF(file);
       sessionIdRef.current = data.session_id;
-      setUploadedFile({
+      const uploaded: UploadedFile = {
         sessionId: data.session_id,
         filename: data.filename,
         chunkCount: data.chunk_count,
-      });
+      };
+      setUploadedFile(uploaded);
       setMessages([]);
       setState("ready");
     } catch (err) {
@@ -57,20 +93,48 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       role: "user",
       content: question,
     };
-    setMessages((prev) => [...prev, userMsg]);
+
+    const assistantId = crypto.randomUUID();
+    const assistantMsg: Message = {
+      id: assistantId,
+      role: "assistant",
+      content: "",
+      sources: [],
+      streaming: true,
+    };
+
+    setMessages((prev) => [...prev, userMsg, assistantMsg]);
     setState("chatting");
 
     try {
-      const data = await askQuestion(sessionIdRef.current, question);
-      const assistantMsg: Message = {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: data.answer,
-        sources: data.sources,
-      };
-      setMessages((prev) => [...prev, assistantMsg]);
+      await streamQuestion(sessionIdRef.current, question, {
+        onSources: (sources) => {
+          setMessages((prev) =>
+            prev.map((m) => (m.id === assistantId ? { ...m, sources } : m))
+          );
+        },
+        onDelta: (delta) => {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId ? { ...m, content: m.content + delta } : m
+            )
+          );
+        },
+        onDone: () => {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId ? { ...m, streaming: false } : m
+            )
+          );
+        },
+        onError: (msg) => {
+          setError(msg);
+          setMessages((prev) => prev.filter((m) => m.id !== assistantId));
+        },
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Chat failed");
+      setMessages((prev) => prev.filter((m) => m.id !== assistantId));
     } finally {
       setState("ready");
     }
@@ -85,19 +149,12 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     setMessages([]);
     setError(null);
     setState("idle");
+    localStorage.removeItem(STORAGE_KEY);
   }, []);
 
   return (
     <ChatContext.Provider
-      value={{
-        state,
-        uploadedFile,
-        messages,
-        error,
-        handleUpload,
-        handleQuestion,
-        handleReset,
-      }}
+      value={{ state, uploadedFile, messages, error, handleUpload, handleQuestion, handleReset }}
     >
       {children}
     </ChatContext.Provider>

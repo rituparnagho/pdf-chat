@@ -5,6 +5,7 @@ export interface Message {
   role: "user" | "assistant";
   content: string;
   sources?: string[];
+  streaming?: boolean;
 }
 
 export interface UploadedFile {

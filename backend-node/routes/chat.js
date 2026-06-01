@@ -32,13 +32,12 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       return res.status(422).json({ detail: 'Could not extract text from PDF.' });
     }
 
-    const chunkSize  = parseInt(process.env.CHUNK_SIZE   || '800');
+    const chunkSize    = parseInt(process.env.CHUNK_SIZE    || '800');
     const chunkOverlap = parseInt(process.env.CHUNK_OVERLAP || '100');
-    const chunks = chunkText(text, chunkSize, chunkOverlap);
-
-    const embeddings = await getEmbeddings(chunks);
-    const sessionId  = uuidv4();
-    const chunkCount = createSession(sessionId, chunks, embeddings);
+    const chunks       = chunkText(text, chunkSize, chunkOverlap);
+    const embeddings   = await getEmbeddings(chunks);
+    const sessionId    = uuidv4();
+    const chunkCount   = createSession(sessionId, chunks, embeddings);
 
     res.json({
       session_id:  sessionId,
@@ -52,20 +51,17 @@ router.post('/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-// POST /api/chat
+// POST /api/chat  (non-streaming, kept as fallback)
 router.post('/chat', async (req, res) => {
   try {
     const { session_id, question } = req.body;
-    if (!question?.trim()) {
-      return res.status(400).json({ detail: 'Question cannot be empty.' });
-    }
+    if (!question?.trim()) return res.status(400).json({ detail: 'Question cannot be empty.' });
 
     const queryEmbedding = await getQueryEmbedding(question);
     const topK   = parseInt(process.env.TOP_K_RESULTS || '4');
     const chunks = querySession(session_id, queryEmbedding, topK);
-
-    const context   = chunks.join('\n\n---\n\n');
-    const chatModel = process.env.CHAT_MODEL || 'llama-3.1-8b-instant';
+    const context    = chunks.join('\n\n---\n\n');
+    const chatModel  = process.env.CHAT_MODEL || 'llama-3.1-8b-instant';
 
     const completion = await getGroq().chat.completions.create({
       model: chatModel,
@@ -76,14 +72,59 @@ router.post('/chat', async (req, res) => {
       ],
     });
 
-    res.json({
-      answer:  completion.choices[0].message.content || '',
-      sources: chunks,
-    });
+    res.json({ answer: completion.choices[0].message.content || '', sources: chunks });
   } catch (err) {
     console.error('[chat]', err);
-    const status = err.message.includes('not found') ? 404 : 500;
-    res.status(status).json({ detail: err.message });
+    res.status(err.message.includes('not found') ? 404 : 500).json({ detail: err.message });
+  }
+});
+
+// POST /api/chat/stream  (Server-Sent Events streaming)
+router.post('/chat/stream', async (req, res) => {
+  const { session_id, question } = req.body;
+  if (!question?.trim()) return res.status(400).json({ detail: 'Question cannot be empty.' });
+
+  // SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', process.env.FRONTEND_URL || 'http://localhost:5173');
+  res.flushHeaders();
+
+  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+
+  try {
+    const queryEmbedding = await getQueryEmbedding(question);
+    const topK   = parseInt(process.env.TOP_K_RESULTS || '4');
+    const chunks = querySession(session_id, queryEmbedding, topK);
+
+    // Send sources first so UI can display them immediately
+    send({ type: 'sources', sources: chunks });
+
+    const context   = chunks.join('\n\n---\n\n');
+    const chatModel = process.env.CHAT_MODEL || 'llama-3.1-8b-instant';
+
+    const stream = await getGroq().chat.completions.create({
+      model: chatModel,
+      temperature: 0.2,
+      stream: true,
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user',   content: `Context from PDF:\n\n${context}\n\nQuestion: ${question}` },
+      ],
+    });
+
+    for await (const chunk of stream) {
+      const delta = chunk.choices[0]?.delta?.content || '';
+      if (delta) send({ type: 'delta', content: delta });
+    }
+
+    send({ type: 'done' });
+  } catch (err) {
+    console.error('[stream]', err);
+    send({ type: 'error', message: err.message });
+  } finally {
+    res.end();
   }
 });
 
